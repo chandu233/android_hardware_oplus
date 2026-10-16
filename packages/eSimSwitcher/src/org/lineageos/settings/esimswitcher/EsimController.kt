@@ -292,11 +292,11 @@ class EsimController(context: Context) {
                 .map { UiccSlotMapping(it.portIndex, it.physicalSlotIndex, it.logicalSlotIndex) }
                 .toSet() == mapping.toSet()
         if (mappingMatches()) return
-        val changed = CountDownLatch(1)
+        val changed = Semaphore(0)
         val receiver =
             object : BroadcastReceiver() {
                 override fun onReceive(context: Context, intent: Intent) {
-                    if (mappingMatches()) changed.countDown()
+                    changed.release()
                 }
             }
         context.registerReceiver(
@@ -308,8 +308,12 @@ class EsimController(context: Context) {
         )
         try {
             telephony.setSimSlotMapping(mapping)
-            if (!mappingMatches()) changed.await(10, TimeUnit.SECONDS)
-            check(mappingMatches()) { "Physical SIM mapping did not settle" }
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+            while (!mappingMatches()) {
+                val remaining = deadline - System.nanoTime()
+                check(remaining > 0) { "Physical SIM mapping did not settle" }
+                changed.tryAcquire(remaining, TimeUnit.NANOSECONDS)
+            }
         } finally {
             context.unregisterReceiver(receiver)
         }
