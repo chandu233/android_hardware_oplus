@@ -106,12 +106,16 @@ class EsimController(context: Context) {
                         getSwitchableSlotMapping() != null
                 ) {
                     Dispatchers.IO.asExecutor().execute {
+                        val dialogs = SimDialogSuppression(context)
                         var success = false
                         try {
+                            dialogs.acquire()
                             restoreProfiles()
                             success = true
                         } catch (e: Exception) {
                             Log.e(TAG, "Failed to restore eSIM profiles", e)
+                        } finally {
+                            dialogs.close()
                         }
                         complete(success)
                     }
@@ -145,8 +149,10 @@ class EsimController(context: Context) {
     ) {
         Dispatchers.IO.asExecutor().execute {
             var service: SEService? = null
+            val dialogs = if (slotMapping != null) SimDialogSuppression(context) else null
             var success = false
             try {
+                dialogs?.acquire()
                 if (state == 0 && slotMapping != null) preparePhysicalSimMode(slotMapping)
                 val connected = CountDownLatch(1)
                 service = SEService(context, Dispatchers.IO.asExecutor()) { connected.countDown() }
@@ -178,6 +184,7 @@ class EsimController(context: Context) {
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to shutdown SEService", e)
                 }
+                dialogs?.close()
                 onComplete(success)
             }
         }
