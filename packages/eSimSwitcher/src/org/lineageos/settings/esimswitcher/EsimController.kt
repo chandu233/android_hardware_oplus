@@ -19,6 +19,7 @@ import android.telephony.UiccSlotMapping
 import android.telephony.euicc.EuiccManager
 import android.util.Log
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.Dispatchers
@@ -102,6 +103,7 @@ class EsimController(context: Context) {
                 channel?.close()
                 session?.close()
                 if (slotMapping != null) awaitSimState(state, slotMapping)
+                if (state == 1 && slotMapping != null) restoreProfiles()
                 success = currentGpioState() == state
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to switch eSIM state", e)
@@ -147,14 +149,14 @@ class EsimController(context: Context) {
                     }
                     .toSet() == ports &&
                 telephony.uiccCardsInfo.any {
-                    it.physicalSlotIndex == slot && it.isEuicc
+                    it.physicalSlotIndex == slot && it.isEuicc && (state != 1 || it.cardId >= 0)
                 } == (state == 1)
         }
-        val changed = CountDownLatch(1)
+        val changed = Semaphore(0)
         val receiver =
             object : BroadcastReceiver() {
                 override fun onReceive(context: Context, intent: Intent) {
-                    if (ready()) changed.countDown()
+                    changed.release()
                 }
             }
         context.registerReceiver(
@@ -173,7 +175,7 @@ class EsimController(context: Context) {
                 val remaining = deadline - System.nanoTime()
                 if (remaining <= 0) break
                 // Card and mapping queries can settle after their broadcasts are delivered.
-                changed.await(
+                changed.tryAcquire(
                     minOf(remaining, TimeUnit.MILLISECONDS.toNanos(100)),
                     TimeUnit.NANOSECONDS,
                 )
@@ -200,6 +202,16 @@ class EsimController(context: Context) {
                 .filter { it.isEmbedded }
         check(card != null || subscriptions.isEmpty()) { "eUICC card information is unavailable" }
         val activeProfiles = subscriptions.filter { it.cardId == card?.cardId }
+        val preferences = profilePreferences()
+        if (!preferences.contains(SAVED_PROFILES)) {
+            val saved =
+                activeProfiles
+                    .map { SavedProfile(it.cardId, it.subscriptionId, it.portIndex).encode() }
+                    .toSet()
+            check(preferences.edit().putStringSet(SAVED_PROFILES, saved).commit()) {
+                "Failed to save active eSIM profiles"
+            }
+        }
         for (subscription in activeProfiles) {
             switchProfile(
                 subscription.cardId,
@@ -241,6 +253,78 @@ class EsimController(context: Context) {
             check(mappingMatches()) { "Physical SIM mapping did not settle" }
         } finally {
             context.unregisterReceiver(receiver)
+        }
+    }
+
+    private fun profilePreferences() =
+        context
+            .createDeviceProtectedStorageContext()
+            .getSharedPreferences(PROFILE_PREFERENCES, Context.MODE_PRIVATE)
+
+    private fun restoreProfiles() {
+        val preferences = profilePreferences()
+        val saved = preferences.getStringSet(SAVED_PROFILES, null) ?: return
+        val available =
+            checkNotNull(
+                context
+                    .getSystemService(SubscriptionManager::class.java)
+                    .availableSubscriptionInfoList
+            ) {
+                "Available eSIM profiles could not be read"
+            }
+        val telephony = context.getSystemService(TelephonyManager::class.java)
+        val profiles =
+            saved.map(SavedProfile::decode).filter { profile ->
+                available.any {
+                    it.isEmbedded &&
+                        it.cardId == profile.cardId &&
+                        it.subscriptionId == profile.subscriptionId
+                }
+            }
+        val mapping =
+            telephony.simSlotMapping
+                .map { UiccSlotMapping(it.portIndex, it.physicalSlotIndex, it.logicalSlotIndex) }
+                .toMutableList()
+        val ports =
+            profiles
+                .map { (cardId, _, portIndex) ->
+                    val card = telephony.uiccCardsInfo.single { it.cardId == cardId && it.isEuicc }
+                    card.physicalSlotIndex to portIndex
+                }
+                .toSet()
+        for ((slot, port) in ports) {
+            if (mapping.any { it.physicalSlotIndex == slot && it.portIndex == port }) continue
+            // Reuse this eUICC's logical slot before displacing a physical SIM.
+            val existing =
+                mapping.indexOfFirst {
+                    it.physicalSlotIndex == slot && (it.physicalSlotIndex to it.portIndex) !in ports
+                }
+            val index =
+                if (existing >= 0) existing
+                else mapping.indexOfFirst { (it.physicalSlotIndex to it.portIndex) !in ports }
+            check(index >= 0) { "No logical SIM slot available for saved eSIM profile" }
+            mapping[index] = UiccSlotMapping(port, slot, mapping[index].logicalSlotIndex)
+        }
+        setSlotMapping(mapping)
+        for ((cardId, subscriptionId, portIndex) in profiles.sortedBy { it.portIndex }) {
+            val active =
+                context
+                    .getSystemService(SubscriptionManager::class.java)
+                    .activeSubscriptionInfoList
+                    .orEmpty()
+            if (active.any { it.subscriptionId == subscriptionId && it.portIndex == portIndex }) {
+                continue
+            }
+            val euicc = context.getSystemService(EuiccManager::class.java).createForCardId(cardId)
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+            while (euicc.euiccInfo == null) {
+                check(System.nanoTime() < deadline) { "eUICC profile service is not ready" }
+                TimeUnit.MILLISECONDS.sleep(100)
+            }
+            switchProfile(cardId, subscriptionId, portIndex)
+        }
+        check(preferences.edit().remove(SAVED_PROFILES).commit()) {
+            "Failed to clear saved eSIM profiles"
         }
     }
 
@@ -348,8 +432,32 @@ class EsimController(context: Context) {
         }
     }
 
+    private data class SavedProfile(val cardId: Int, val subscriptionId: Int, val portIndex: Int) {
+        init {
+            require(
+                cardId >= 0 &&
+                    SubscriptionManager.isValidSubscriptionId(subscriptionId) &&
+                    portIndex >= 0
+            ) {
+                "Invalid saved eSIM profile"
+            }
+        }
+
+        fun encode() = "$cardId:$subscriptionId:$portIndex"
+
+        companion object {
+            fun decode(value: String): SavedProfile {
+                val fields = value.split(':')
+                require(fields.size == 3) { "Invalid saved eSIM profile" }
+                return SavedProfile(fields[0].toInt(), fields[1].toInt(), fields[2].toInt())
+            }
+        }
+    }
+
     companion object {
         private const val TAG = "OplusEsimController"
+        private const val PROFILE_PREFERENCES = "esim_profiles"
+        private const val SAVED_PROFILES = "profiles"
 
         private val switchInProgress = MutableStateFlow(false)
 
