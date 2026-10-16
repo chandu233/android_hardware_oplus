@@ -99,7 +99,25 @@ class EsimController(context: Context) {
 
             if (state == gpioState) {
                 Log.d(TAG, "No need to change eSIM state")
-                complete(true)
+                if (
+                    state == 1 &&
+                        hasSN220Chipset &&
+                        profilePreferences().contains(SAVED_PROFILES) &&
+                        getSwitchableSlotMapping() != null
+                ) {
+                    Dispatchers.IO.asExecutor().execute {
+                        var success = false
+                        try {
+                            restoreProfiles()
+                            success = true
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Failed to restore eSIM profiles", e)
+                        }
+                        complete(success)
+                    }
+                } else {
+                    complete(true)
+                }
                 return
             }
 
