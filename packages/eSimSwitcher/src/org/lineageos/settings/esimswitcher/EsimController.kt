@@ -10,6 +10,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.os.ServiceManager
 import android.os.SystemProperties
 import android.se.omapi.SEService
@@ -41,6 +42,46 @@ class EsimController(context: Context) {
         get() = requestedState
 
     fun currentGpioState() = oplusEsimService?.esimGpio ?: 0
+
+    data class EnableImpact(val physicalSlotIndex: Int, val disablesAllPhysicalSims: Boolean)
+
+    fun getEnableImpact(): EnableImpact? {
+        try {
+            val slot =
+                context.resources
+                    .getIntArray(com.android.internal.R.array.non_removable_euicc_slots)
+                    .singleOrNull() ?: return null
+            if (!hasSN220Chipset || getSwitchableSlotMapping() == null) {
+                return EnableImpact(slot, false)
+            }
+            val profiles = getProfilesToRestore()
+            checkProfileCapacity(profiles)
+            val modems = context.getSystemService(TelephonyManager::class.java).activeModemCount
+            if (profiles.size > 1 && profiles.size < modems) return null
+            return EnableImpact(slot, profiles.size > 1)
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "Unable to determine eSIM enable impact", e)
+            return null
+        }
+    }
+
+    private fun checkProfileCapacity(profiles: List<SavedProfile>) {
+        if (profiles.size <= 1) return
+        check(context.packageManager.hasSystemFeature(PackageManager.FEATURE_TELEPHONY_EUICC_MEP)) {
+            "Multiple enabled eSIM profiles are not supported"
+        }
+        check(
+            profiles.size <= context.getSystemService(TelephonyManager::class.java).activeModemCount
+        ) {
+            "Not enough active modems for saved eSIM profiles"
+        }
+        check(
+            profiles.map { it.cardId }.distinct().size == 1 &&
+                profiles.map { it.portIndex }.distinct().size == profiles.size
+        ) {
+            "Invalid saved eSIM port assignments"
+        }
+    }
 
     fun toggleEsimState(state: Int, onComplete: (Boolean) -> Unit) {
         if (!requestedState.compareAndSet(null, state)) {
@@ -261,9 +302,9 @@ class EsimController(context: Context) {
             .createDeviceProtectedStorageContext()
             .getSharedPreferences(PROFILE_PREFERENCES, Context.MODE_PRIVATE)
 
-    private fun restoreProfiles() {
-        val preferences = profilePreferences()
-        val saved = preferences.getStringSet(SAVED_PROFILES, null) ?: return
+    private fun getProfilesToRestore(): List<SavedProfile> {
+        val saved = profilePreferences().getStringSet(SAVED_PROFILES, null) ?: return emptyList()
+        if (saved.isEmpty()) return emptyList()
         val available =
             checkNotNull(
                 context
@@ -272,15 +313,32 @@ class EsimController(context: Context) {
             ) {
                 "Available eSIM profiles could not be read"
             }
-        val telephony = context.getSystemService(TelephonyManager::class.java)
-        val profiles =
-            saved.map(SavedProfile::decode).filter { profile ->
-                available.any {
-                    it.isEmbedded &&
-                        it.cardId == profile.cardId &&
-                        it.subscriptionId == profile.subscriptionId
-                }
+        return saved.map(SavedProfile::decode).filter { profile ->
+            available.any {
+                it.isEmbedded &&
+                    it.cardId == profile.cardId &&
+                    it.subscriptionId == profile.subscriptionId
             }
+        }
+    }
+
+    private fun restoreProfiles() {
+        val preferences = profilePreferences()
+        if (!preferences.contains(SAVED_PROFILES)) return
+        val profiles = getProfilesToRestore()
+        checkProfileCapacity(profiles)
+        val telephony = context.getSystemService(TelephonyManager::class.java)
+        for ((cardId, cardProfiles) in profiles.groupBy { it.cardId }) {
+            val card = telephony.uiccCardsInfo.single { it.cardId == cardId && it.isEuicc }
+            check(cardProfiles.size <= 1 || card.isMultipleEnabledProfilesSupported) {
+                "eUICC does not support multiple enabled profiles"
+            }
+            check(
+                cardProfiles.all { profile -> card.ports.any { it.portIndex == profile.portIndex } }
+            ) {
+                "Saved eSIM port is unavailable"
+            }
+        }
         val mapping =
             telephony.simSlotMapping
                 .map { UiccSlotMapping(it.portIndex, it.physicalSlotIndex, it.logicalSlotIndex) }
