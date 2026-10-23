@@ -869,6 +869,28 @@ aidl_interface {
     frozen: true,
 }
 
+// Stock reuses V1 with an incompatible transaction layout. Keep the legacy API intact.
+aidl_interface {
+    name: "vendor.oplus.hardware.subsys_radio-compat",
+    system_ext_specific: true,
+    odm_available: true,
+    local_include_dir: "aidl-compat",
+    srcs: ["aidl-compat/vendor/oplus/hardware/subsys_interface/subsys_radio/*.aidl"],
+    stability: "vintf",
+    owner: "oplus",
+
+    backend: {
+        cpp: {
+            enabled: false,
+        },
+        java: {
+            enabled: false,
+        },
+    },
+    imports: ["vendor.oplus.hardware.subsys-V5"],
+    frozen: false,
+}
+
 aidl_interface {
     name: "vendor.oplus.hardware.touch",
     system_ext_specific: true,
